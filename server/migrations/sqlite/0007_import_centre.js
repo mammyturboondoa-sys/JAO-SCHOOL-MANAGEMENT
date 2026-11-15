@@ -1,5 +1,5 @@
 'use strict';
-// 0007: Data Import Centre and GCE Board results.
+// 00011: Data Import Centre and GCE Board results.
 // Additive only: nothing existing is altered. Every link to school data is a COMPOSITE (school_id, id) key,
 // so the database itself refuses a row that points at another school's records.
 module.exports = {
