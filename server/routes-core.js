@@ -40,15 +40,23 @@ module.exports = function (app) {
   // (super administrator page). Credentials only work in their own context; every miss looks identical.
   const isUsable = (school) => !!school && school.status === 'active' && school.approval === 'approved';
   route('POST', '/auth/login', 'public', async (c) => {
-    const email = S.str(c.body.email, 200).toLowerCase();
+    // Parent Access: school code + (phone or email). `identifier` is used by the parent page; `email` keeps working for every other sign-in.
+    const identifier = S.str(c.body.identifier, 200).toLowerCase();
+    const email = identifier && identifier.includes('@') ? identifier : S.str(c.body.email, 200).toLowerCase();
     const password = typeof c.body.password === 'string' ? c.body.password : '';
     const slug = S.str(c.body.school_slug, 60);
+    const code = S.str(c.body.school_code, 40);
+    const rawPhone = identifier && !identifier.includes('@') ? identifier.replace(/[ ().-]/g, '') : '';
     const platformScope = c.body.scope === 'platform';
     const ip = app.clientIp(c.req);
-    if (!S.rateLimit(`login:${ip}:${email}`)) throw new S.HttpError(429, 'too_many_attempts');
+    if (!S.rateLimit(`login:${ip}:${email || rawPhone}`)) throw new S.HttpError(429, 'too_many_attempts');
     // The same email may exist in several schools (a separate account in each), so the sign-in page decides which one.
     let u = null;
-    if (platformScope) u = await h.get("SELECT * FROM users WHERE email = ? AND school_id IS NULL AND role = 'platform_owner'", email);
+    if (code) { // parent sign-in by school code: only parent accounts, phone or email, in that one school
+      const target = await h.get('SELECT id FROM schools WHERE LOWER(code) = LOWER(?)', code);
+      if (target) u = rawPhone ? (/^\+?\d{6,16}$/.test(rawPhone) ? await h.get("SELECT u.* FROM users u JOIN user_phones p ON p.user_id = u.id AND p.school_id = u.school_id WHERE u.school_id = ? AND p.phone = ? AND u.role = 'parent'", target.id, rawPhone) : null)
+        : await h.get("SELECT * FROM users WHERE school_id = ? AND email = ? AND role = 'parent'", target.id, email);
+    } else if (platformScope) u = await h.get("SELECT * FROM users WHERE email = ? AND school_id IS NULL AND role = 'platform_owner'", email);
     else if (slug) {
       const target = await h.get('SELECT id FROM schools WHERE slug = ?', slug);
       u = target ? await h.get('SELECT * FROM users WHERE email = ? AND school_id = ?', email, target.id) : null;
@@ -60,13 +68,13 @@ module.exports = function (app) {
     const contextOk = true;
     const credsOk = !!(u && u.active && contextOk && S.verifyPassword(password, u.password_hash));
     const ok = credsOk && (!u.school_id || isUsable(school));
-    await h.run('INSERT INTO login_log (user_id, school_id, email, ok) VALUES (?,?,?,?)', u ? u.id : null, u ? u.school_id : null, email.slice(0, 100), ok ? 1 : 0);
+    await h.run('INSERT INTO login_log (user_id, school_id, email, ok) VALUES (?,?,?,?)', u ? u.id : null, u ? u.school_id : null, (email || rawPhone).slice(0, 100), ok ? 1 : 0);
     if (!ok) {
       // Only someone who proved the right password learns WHY their school is locked.
       if (credsOk && school) throw new S.HttpError(403, school.approval === 'pending' ? 'school_pending' : school.approval === 'rejected' ? 'school_rejected' : 'school_suspended');
       throw new S.HttpError(401, 'invalid_credentials');
     }
-    S.resetRate(`login:${ip}:${email}`);
+    S.resetRate(`login:${ip}:${email || rawPhone}`);
     const mine = ownerFilter(u);
     await h.run(`UPDATE users SET previous_login = last_login, last_login = NOW_TS WHERE id = ? AND ${mine.sql}`, u.id, ...mine.params);
     const { token, csrf } = await S.createSession(h, u.id);
@@ -88,12 +96,16 @@ module.exports = function (app) {
   app.routes.at(-1).allowWhenMustChange = true;
 
   route('POST', '/auth/change-password', 'user', async (c) => {
+    if (!S.rateLimit(`chpw:${c.user.id}`, 8)) throw new S.HttpError(429, 'too_many_attempts'); // guesses of the current password are limited
     const row = await h.get('SELECT password_hash FROM users WHERE id = ?', c.user.id);
     if (!S.verifyPassword(String(c.body.current_password || ''), row.password_hash)) throw new S.HttpError(400, 'wrong_password');
     const problem = S.passwordProblem(c.body.new_password);
     if (problem) throw S.bad(problem);
+    if (S.verifyPassword(String(c.body.new_password), row.password_hash)) throw S.bad('password_same'); // the new password must differ from the current (temporary) one
     { const mine = ownerFilter(c.user); await h.run(`UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ? AND ${mine.sql}`, S.hashPassword(c.body.new_password), c.user.id, ...mine.params); }
     await h.run('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?', c.user.id, require('node:crypto').createHash('sha256').update(c.token).digest('hex'));
+    S.resetRate(`chpw:${c.user.id}`);
+    if (c.user.role === 'platform_owner') await h.run("INSERT INTO owner_security (user_id, password_changed_at) VALUES (?, NOW_TS) ON CONFLICT(user_id) DO UPDATE SET password_changed_at = excluded.password_changed_at", c.user.id);
     await h.audit(c.schoolId, c.user.id, 'password_changed', `user:${c.user.id}`);
     return { ok: true };
   });

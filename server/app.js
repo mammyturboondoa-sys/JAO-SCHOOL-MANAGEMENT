@@ -45,6 +45,11 @@ async function createApp({ dbFile, dataDir, secureCookies = false, env = process
   require('./routes-discipline')(app);
   require('./routes-scholarships')(app);
   require('./routes-convocations')(app);
+  require('./routes-import')(app);
+  require('./routes-platform')(app);
+  require('./routes-parents')(app);
+  require('./routes-finder')(app);
+  require('./routes-owner')(app);
 
   function send(res, status, body, headers = {}) {
     res.writeHead(status, { ...SECURITY_HEADERS, ...(secureCookies ? { 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' } : {}), ...headers });

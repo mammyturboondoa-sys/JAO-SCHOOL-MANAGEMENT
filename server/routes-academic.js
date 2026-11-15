@@ -479,6 +479,7 @@ module.exports = function (app) {
       ON CONFLICT(student_id, term_id) DO UPDATE SET comment=excluded.comment, status=excluded.status, approved_by=excluded.approved_by, approved_at=excluded.approved_at`,
       c.schoolId, s.id, term.id, S.str(c.body.comment, 500) || null, approve ? 'approved' : 'draft', approve ? c.user.id : null, approve ? new Date().toISOString() : null);
     await h.audit(c.schoolId, c.user.id, approve ? 'report_approved' : 'report_unapproved', `student:${s.id}/term:${term.id}`);
+    if (approve && app.tellParents) await app.tellParents(c.schoolId, s.id, 'report_published', { student: s.full_name, term: term.name }, '#/parent?tab=results');
   });
 
   route('GET', '/reports/class', ADMIN, async (c) => {

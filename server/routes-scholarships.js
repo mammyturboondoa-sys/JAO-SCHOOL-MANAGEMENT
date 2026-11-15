@@ -253,12 +253,12 @@ module.exports = function (app) {
   });
 
   // family notices: the student's own account and linked parent accounts (stored in-app notifications only)
-  async function tellFamily(c, a, kind) {
+  async function tellFamily(c, a, kind, link) {
     const ids = new Set();
     for (const u of await h.all("SELECT id FROM users WHERE school_id = ? AND role = 'student' AND student_id = ? AND active = 1", c.schoolId, a.student_id)) ids.add(u.id);
     for (const u of await h.all(`SELECT DISTINCT g.user_id id FROM student_guardians sg JOIN guardians g ON g.id = sg.guardian_id AND g.school_id = sg.school_id JOIN users u ON u.id = g.user_id AND u.school_id = g.school_id
       WHERE sg.school_id = ? AND sg.student_id = ? AND u.role = 'parent' AND u.active = 1`, c.schoolId, a.student_id)) ids.add(u.id);
-    for (const id of ids) await app.notify(c.schoolId, id, kind, { title: a.title, student: a.student_name }, '#/scholarships?tab=applications');
+    for (const id of ids) await app.notify(c.schoolId, id, kind, { title: a.title, student: a.student_name }, link || '#/scholarships?tab=applications');
   }
 
   route('POST', '/scholarship-applications/:id/submit', ['student', 'parent'], async (c) => {
@@ -345,6 +345,124 @@ module.exports = function (app) {
     if (d === 'approved' && (await h.get("SELECT COUNT(*) n FROM scholarship_applications WHERE scholarship_id = ? AND school_id = ? AND status = 'approved'", a.scholarship_id, c.schoolId)).n >= a.places) throw S.bad('no_places_left');
     await h.run('UPDATE scholarship_applications SET status = ?, decision_reason = ?, decided_by = ?, decided_at = NOW_TS, updated_at = NOW_TS WHERE id = ? AND school_id = ?', d, reason, c.user.id, a.id, c.schoolId);
     await h.audit(c.schoolId, c.user.id, `scholarship_application_${d}`, `scholarship_application:${a.id}`);
+    if (d === 'approved') {
+      const today = todayStr();
+      const aid = await h.insert('INSERT INTO scholarship_awards (school_id, application_id, scholarship_id, student_id, awarded_on, valid_from) VALUES (?,?,?,?,?,?)', c.schoolId, a.id, a.scholarship_id, a.student_id, today, today);
+      await h.run('INSERT INTO scholarship_award_events (school_id, award_id, event, actor_id) VALUES (?,?,?,?)', c.schoolId, aid, 'awarded', c.user.id);
+    }
     await tellFamily(c, a, `scholarship_${d}`);
+  });
+
+  // =====================================================================================================
+  // RECIPIENTS, RENEWALS, REPORTS (phase 3)
+  // An award is created automatically when an application is approved. The administrator manages it; families see only their own.
+  // =====================================================================================================
+  const AW_SELECT = `SELECT w.*, sc.title, sc.category, sc.renewal_conditions, sc.benefits, st.full_name student_name, st.student_code, cl.name cname, cl.section csection
+    FROM scholarship_awards w JOIN scholarships sc ON sc.id = w.scholarship_id AND sc.school_id = w.school_id JOIN students st ON st.id = w.student_id AND st.school_id = w.school_id
+    LEFT JOIN classes cl ON cl.id = st.class_id AND cl.school_id = st.school_id`;
+  const awShape = (w) => ({ id: w.id, application_id: w.application_id, scholarship: { id: w.scholarship_id, title: w.title, category: w.category }, student: { id: w.student_id, full_name: w.student_name, student_code: w.student_code, class_label: classLabel(w.cname, w.csection) },
+    awarded_on: w.awarded_on, valid_from: w.valid_from, valid_until: w.valid_until, status: w.status, status_note: w.status_note, benefits: w.benefits, renewal_conditions: w.renewal_conditions,
+    expired: !!(w.valid_until && w.status !== 'ended' && w.valid_until < todayStr()) });
+  async function awardScope(c) {
+    if (c.user.role === 'school_admin') return { where: 'w.school_id = ?', params: [c.schoolId], admin: true };
+    if (c.user.role === 'teacher') throw S.forbidden();
+    const sc = A.studentScope(c.user);
+    return { where: `w.school_id = ? AND w.student_id IN (SELECT s.id FROM students s WHERE ${sc.where})`, params: [c.schoolId, ...sc.params] };
+  }
+  async function loadAward(c) {
+    const n = S.toInt(c.params.id), sc = await awardScope(c);
+    const w = n === null ? null : await h.get(`${AW_SELECT} WHERE ${sc.where} AND w.id = ?`, ...sc.params, n);
+    if (!w) throw S.notFound();
+    return { w, sc };
+  }
+  const awEvent = (c, id, ev, note) => h.run('INSERT INTO scholarship_award_events (school_id, award_id, event, note, actor_id) VALUES (?,?,?,?,?)', c.schoolId, id, ev, note || null, c.user.id);
+  async function tellAward(c, w, kind) {
+    const a = { student_id: w.student_id, title: w.title, student_name: w.student_name };
+    return tellFamily(c, a, kind, '#/scholarships?tab=recipients');
+  }
+
+  route('GET', '/scholarship-awards', ['school_admin', 'student', 'parent'], async (c) => {
+    const sc = await awardScope(c), where = [sc.where], p = [...sc.params];
+    if (S.toInt(c.query.scholarship_id) !== null) { where.push('w.scholarship_id = ?'); p.push(Number(c.query.scholarship_id)); }
+    if (['active', 'suspended', 'ended'].includes(c.query.status)) { where.push('w.status = ?'); p.push(c.query.status); }
+    const q = S.str(c.query.q, 80);
+    if (q && sc.admin) { where.push("(LOWER(st.full_name) LIKE LOWER(?) ESCAPE '\\' OR LOWER(st.student_code) LIKE LOWER(?) ESCAPE '\\')"); const l = `%${q.replace(/[\\%_]/g, '\\$&')}%`; p.push(l, l); }
+    return (await h.all(`${AW_SELECT} WHERE ${where.join(' AND ')} ORDER BY w.id DESC LIMIT 300`, ...p)).map(awShape);
+  });
+  route('GET', '/scholarship-awards/:id', ['school_admin', 'student', 'parent'], async (c) => {
+    const { w, sc } = await loadAward(c);
+    const events = await h.all('SELECT e.event, e.note, e.created_at, u.name actor FROM scholarship_award_events e LEFT JOIN users u ON u.id = e.actor_id AND u.school_id = e.school_id WHERE e.award_id = ? AND e.school_id = ? ORDER BY e.id', w.id, c.schoolId);
+    const renewals = await h.all('SELECT r.period_label, r.review_date, r.outcome, r.note, r.created_at, u.name decided_by FROM scholarship_renewals r JOIN users u ON u.id = r.decided_by AND u.school_id = r.school_id WHERE r.award_id = ? AND r.school_id = ? ORDER BY r.id', w.id, c.schoolId);
+    // families see the history of what happened, but not internal notes on suspensions
+    return { ...awShape(w), events: events.map((e) => (sc.admin ? e : { ...e, note: e.event === 'renewed' || e.event === 'not_renewed' ? e.note : null })), renewals: sc.admin ? renewals : renewals.map((r) => ({ ...r, note: r.note })), can_manage: !!sc.admin };
+  });
+  route('PUT', '/scholarship-awards/:id', ADMIN, async (c) => {
+    const { w } = await loadAward(c);
+    if (w.status === 'ended') throw S.bad('invalid_status');
+    const from = c.body.valid_from === undefined ? w.valid_from : c.body.valid_from, until = c.body.valid_until === undefined ? w.valid_until : (c.body.valid_until || null);
+    if (!S.isDate(from) || (until !== null && !S.isDate(until)) || (until && until < from)) throw S.bad('invalid_date');
+    await h.run('UPDATE scholarship_awards SET valid_from = ?, valid_until = ?, updated_at = NOW_TS WHERE id = ? AND school_id = ?', from, until, w.id, c.schoolId);
+    await awEvent(c, w.id, 'dates_changed', `${from} → ${until || '—'}`);
+    await h.audit(c.schoolId, c.user.id, 'scholarship_award_dates_changed', `scholarship_award:${w.id}`);
+  });
+  route('POST', '/scholarship-awards/:id/status', ADMIN, async (c) => {
+    const { w } = await loadAward(c);
+    const to = c.body.status, note = S.str(c.body.note, 1000) || null;
+    if (!['active', 'suspended', 'ended'].includes(to) || w.status === 'ended' || to === w.status) throw S.bad('invalid_status');
+    if (to !== 'active' && !note) throw S.bad('note_required');
+    await h.run('UPDATE scholarship_awards SET status = ?, status_note = ?, updated_at = NOW_TS WHERE id = ? AND school_id = ?', to, to === 'active' ? null : note, w.id, c.schoolId);
+    await awEvent(c, w.id, to === 'active' ? 'resumed' : to, note);
+    await h.audit(c.schoolId, c.user.id, `scholarship_award_${to}`, `scholarship_award:${w.id}`);
+    await tellAward(c, w, `scholarship_award_${to}`);
+  });
+  // a renewal review: "renewed" may extend the end date; "not renewed" ends the award
+  route('POST', '/scholarship-awards/:id/renewals', ADMIN, async (c) => {
+    const { w } = await loadAward(c);
+    if (w.status === 'ended') throw S.bad('invalid_status');
+    const label = S.str(c.body.period_label, 80), note = S.str(c.body.note, 1000) || null, outcome = c.body.outcome;
+    const reviewDate = c.body.review_date || todayStr();
+    if (!label) throw S.bad('period_required');
+    if (!['renewed', 'not_renewed'].includes(outcome) || !S.isDate(reviewDate)) throw S.bad('invalid_data');
+    if (outcome === 'not_renewed' && !note) throw S.bad('note_required');
+    let until = w.valid_until;
+    if (outcome === 'renewed' && c.body.valid_until) { if (!S.isDate(c.body.valid_until) || c.body.valid_until < w.valid_from) throw S.bad('invalid_date'); until = c.body.valid_until; }
+    await h.tx(async () => {
+      await h.run('INSERT INTO scholarship_renewals (school_id, award_id, period_label, review_date, outcome, note, decided_by) VALUES (?,?,?,?,?,?,?)', c.schoolId, w.id, label, reviewDate, outcome, note, c.user.id);
+      await h.run('UPDATE scholarship_awards SET valid_until = ?, status = ?, status_note = ?, updated_at = NOW_TS WHERE id = ? AND school_id = ?', until, outcome === 'not_renewed' ? 'ended' : 'active', outcome === 'not_renewed' ? note : null, w.id, c.schoolId);
+      await awEvent(c, w.id, outcome, `${label}${note ? ` — ${note}` : ''}`);
+      await h.audit(c.schoolId, c.user.id, `scholarship_award_${outcome}`, `scholarship_award:${w.id}`);
+    });
+    await tellAward(c, w, `scholarship_award_${outcome}`);
+  });
+
+  // ----- reports and CSV (administrator only) -----
+  route('GET', '/scholarship-reports', ADMIN, async (c) => {
+    const per = await h.all(`SELECT sc.id, sc.title, sc.category, sc.status, sc.places,
+        (SELECT COUNT(*) FROM scholarship_applications a WHERE a.scholarship_id = sc.id AND a.school_id = sc.school_id AND a.status <> 'draft') applications,
+        (SELECT COUNT(*) FROM scholarship_applications a WHERE a.scholarship_id = sc.id AND a.school_id = sc.school_id AND a.status = 'approved') approved,
+        (SELECT COUNT(*) FROM scholarship_applications a WHERE a.scholarship_id = sc.id AND a.school_id = sc.school_id AND a.status = 'rejected') rejected,
+        (SELECT COUNT(*) FROM scholarship_applications a WHERE a.scholarship_id = sc.id AND a.school_id = sc.school_id AND a.status = 'waitlisted') waitlisted,
+        (SELECT COUNT(*) FROM scholarship_applications a WHERE a.scholarship_id = sc.id AND a.school_id = sc.school_id AND a.status IN ('submitted','under_review')) pending,
+        (SELECT COUNT(*) FROM scholarship_awards w WHERE w.scholarship_id = sc.id AND w.school_id = sc.school_id AND w.status = 'active') active_awards
+      FROM scholarships sc WHERE sc.school_id = ? AND sc.status <> 'draft' ORDER BY sc.id DESC`, c.schoolId);
+    const tot = per.reduce((t, r) => ({ applications: t.applications + r.applications, approved: t.approved + r.approved, rejected: t.rejected + r.rejected, waitlisted: t.waitlisted + r.waitlisted, pending: t.pending + r.pending, active_awards: t.active_awards + r.active_awards }), { applications: 0, approved: 0, rejected: 0, waitlisted: 0, pending: 0, active_awards: 0 });
+    return { totals: tot, scholarships: per };
+  });
+  // Cells that start with = + - @ could run as formulas when opened in a spreadsheet, so they are prefixed with an apostrophe.
+  const csvCell = (v) => { let t = v === null || v === undefined ? '' : String(v); if (/^[=+\-@\t\r]/.test(t)) t = `'${t}`; return /[",\n\r;]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+  const csv = (header, rows) => `﻿${[header, ...rows].map((r) => r.map(csvCell).join(',')).join('\r\n')}\r\n`;
+  route('GET', '/scholarship-reports/export', ADMIN, async (c) => {
+    const type = c.query.type === 'awards' ? 'awards' : 'applications';
+    let body;
+    if (type === 'applications') {
+      const rows = await h.all(`${APP_SELECT} WHERE a.school_id = ? AND a.status <> 'draft' ORDER BY a.id`, c.schoolId);
+      body = csv(['id', 'scholarship', 'category', 'student', 'student_number', 'class', 'status', 'submitted_at', 'average_at_submission', 'decided_at', 'decision_reason'],
+        rows.map((a) => [a.id, a.title, a.category, a.student_name, a.student_code, classLabel(a.cname, a.csection), a.status, a.submitted_at, a.average_at_submission, a.decided_at, a.decision_reason]));
+    } else {
+      const rows = await h.all(`${AW_SELECT} WHERE w.school_id = ? ORDER BY w.id`, c.schoolId);
+      body = csv(['id', 'scholarship', 'category', 'student', 'student_number', 'class', 'status', 'awarded_on', 'valid_from', 'valid_until'], rows.map((w) => [w.id, w.title, w.category, w.student_name, w.student_code, classLabel(w.cname, w.csection), w.status, w.awarded_on, w.valid_from, w.valid_until]));
+    }
+    await h.audit(c.schoolId, c.user.id, 'scholarship_export', `school:${c.schoolId}`, { type });
+    return { __raw: true, body: Buffer.from(body, 'utf8'), headers: { 'Content-Type': 'text/csv; charset=utf-8', 'Cache-Control': 'private, no-store', 'Content-Disposition': `attachment; filename="scholarship-${type}.csv"` } };
   });
 };

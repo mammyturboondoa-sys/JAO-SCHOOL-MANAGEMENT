@@ -16,14 +16,83 @@ const MSG = {
 
 const NUM = '(\\d+(?:\\.\\d+)?)';
 
+
+// ---- numbers written in words (English and French): "twenty five", "vingt-cinq", "quatre-vingt-dix" ----
+const NW = new Map(Object.entries({ zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
+  twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90, hundred: 100, thousand: 1000,
+  un: 1, une: 1, deux: 2, trois: 3, quatre: 4, cinq: 5, sept: 7, huit: 8, neuf: 9, dix: 10, onze: 11, douze: 12, treize: 13, quatorze: 14, quinze: 15, seize: 16,
+  vingt: 20, vingts: 20, trente: 30, quarante: 40, cinquante: 50, soixante: 60, cent: 100, cents: 100, mille: 1000 }));
+const SEP = /^[\s-]+$/;
+function runValue(words) {
+  let total = 0, cur = 0, last = null;
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i], v = NW.get(w); const small = v < 20 && !['hundred', 'thousand', 'cent', 'cents', 'mille'].includes(w);
+    if (w === 'quatre' && (words[i + 1] === 'vingt' || words[i + 1] === 'vingts')) { cur += 80; i++; last = 'tens'; continue; }
+    if (w === 'hundred' || w === 'cent' || w === 'cents') { cur = (cur || 1) * 100; last = 'big'; continue; }
+    if (w === 'thousand' || w === 'mille') { total += (cur || 1) * 1000; cur = 0; last = 'big'; continue; }
+    if (small) { if (last === 'small' && !(words[i - 1] === 'dix' && v >= 7 && v <= 9)) return null; cur += v; last = 'small'; continue; }
+    if (last === 'tens' && !(words[i - 1] === 'vingt' || words[i - 1] === 'vingts')) return null;
+    cur += v; last = 'tens';
+  }
+  return total + cur;
+}
+function wordsToNumbers(s) {
+  const parts = s.split(/([a-z]+)/); const out = []; let i = 0;
+  while (i < parts.length) {
+    const w = parts[i];
+    if (i % 2 === 1 && NW.has(w)) {
+      const words = [w]; let j = i;
+      while (j + 2 < parts.length) {
+        const sep = parts[j + 1], nx = parts[j + 2];
+        if (SEP.test(sep) && NW.has(nx)) { words.push(nx); j += 2; }
+        else if (SEP.test(sep) && (nx === 'and' || nx === 'et') && j + 4 < parts.length && SEP.test(parts[j + 3]) && NW.has(parts[j + 4])
+          && (nx === 'and' ? ['hundred', 'thousand'].includes(words[words.length - 1]) && NW.get(parts[j + 4]) < 100 : ['vingt', 'trente', 'quarante', 'cinquante', 'soixante'].includes(words[words.length - 1]) && ['un', 'une', 'onze'].includes(parts[j + 4]))) { words.push(parts[j + 4]); j += 4; }
+        else break;
+      }
+      const v = runValue(words); out.push(v === null ? parts.slice(i, j + 1).join('') : String(v)); i = j + 1;
+    } else { out.push(w); i++; }
+  }
+  return out.join('');
+}
+// "the sum of 5 and 3", "subtract 2 from 9", "half of 50", "double 8", "la moitié de 50" ...
+const N = '(-?\\d+(?:\\.\\d+)?|\\([^()]*\\))';
+const PHRASES = [
+  [new RegExp(`(?:sum of|somme de|total of)\\s+${N}\\s*(?:and|et|,)\\s*${N}`, 'g'), '$1+$2'],
+  [new RegExp(`(?:add|additionne|ajoute)\\s+${N}\\s*(?:and|to|et|a)\\s+${N}`, 'g'), '$1+$2'],
+  [new RegExp(`(?:subtract|soustrais|soustraire|enleve|retire)\\s+${N}\\s*(?:from|de)\\s+${N}`, 'g'), '$2-$1'],
+  [new RegExp(`(?:difference|ecart)\\s*(?:between|of|entre|de)\\s+${N}\\s*(?:and|et)\\s*${N}`, 'g'), '$1-$2'],
+  [new RegExp(`(?:multiply|multiplie|multiplier)\\s+${N}\\s*(?:by|with|and|par|et)\\s+${N}`, 'g'), '$1*$2'],
+  [new RegExp(`(?:product of|produit de|produit des)\\s+${N}\\s*(?:and|et)\\s*${N}`, 'g'), '$1*$2'],
+  [new RegExp(`(?:divide|divise|diviser)\\s+${N}\\s*(?:by|par)\\s+${N}`, 'g'), '$1/$2'],
+  [new RegExp(`(?:half of|half|la moitie de|moitie de|la moitie)\\s+${N}`, 'g'), '($1/2)'],
+  [new RegExp(`(?:double of|double de|double|twice|le double de|le double)\\s+${N}`, 'g'), '($1*2)'],
+  [new RegExp(`(?:triple of|triple de|triple|thrice|le triple de|le triple)\\s+${N}`, 'g'), '($1*3)'],
+  [new RegExp(`(?:square of|the square of|le carre de|carre de)\\s+${N}`, 'g'), '($1^2)'],
+  [new RegExp(`(?:cube of|the cube of|le cube de|cube de)\\s+${N}`, 'g'), '($1^3)'],
+];
+function isPrime(n) { if (!Number.isSafeInteger(n) || n < 2) return false; if (n % 2 === 0) return n === 2; for (let d = 3; d * d <= n; d += 2) if (n % d === 0) return false; return true; }
+// "is 7 odd?", "est-ce que 13 est premier ?"
+function propertyQuestion(s, lang) {
+  const m = /^(?:is|are|est ce que|est ce|est)?\s*(\d{1,15})\s*(?:is\s+|est\s+)?(?:an?\s+|un\s+|une\s+)?(even|odd|prime|pair|impair|premier)(?:\s+(?:number|nombre))?$/.exec(s.replace(/-/g, ' ').replace(/'/g, ' ').replace(/\s+/g, ' ').trim());
+  if (!m) return null;
+  const n = Number(m[1]); const kind = { pair: 'even', impair: 'odd', premier: 'prime' }[m[2]] || m[2];
+  const ok = kind === 'even' ? n % 2 === 0 : kind === 'odd' ? n % 2 === 1 : isPrime(n);
+  const word = lang === 'fr' ? { even: 'pair', odd: 'impair', prime: 'premier' }[kind] : kind;
+  return `${n} ${lang === 'fr' ? 'est' : 'is'} ${word} → ${MSG[lang][ok ? 'true' : 'false']}`;
+}
+
 // Turn a natural sentence ("what is 15% of 200?", "combien font 3 fois 4 ?") into a plain expression.
 function normalize(raw) {
   let s = String(raw).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
   s = s.replace(/×/g, '*').replace(/÷/g, '/').replace(/[−–—]/g, '-').replace(/≤/g, '<=').replace(/≥/g, '>=').replace(/≠/g, '!=');
   s = s.replace(/(\d),(\d{3})(?!\d)/g, '$1$2').replace(/(\d),(\d)/g, '$1.$2'); // 1,000 -> 1000 ; 2,5 -> 2.5
+  s = wordsToNumbers(s);
   // leading filler such as "what is", "calculate", "combien font" (repeat: they can be stacked)
-  const lead = /^\s*(?:please|s'il (?:te|vous) plait|can you|could you|peux-tu|pouvez-vous|tell me|dis-moi|what's|whats|what is|what are|calculate|compute|solve|evaluate|how much is|how much are|combien font|combien fait|combien est|combien|calcule|calculez|calculer|resous|quel est le resultat de|quel est|c'est quoi|ca fait|donne-moi|give me|the result of|le resultat de|resultat de)\b[\s:,]*/;
+  const lead = /^\s*(?:please|s'il (?:te|vous) plait|can you|could you|peux-tu|pouvez-vous|tell me|dis-moi|what's|whats|what is|what are|is|are|est ce que|est ce|est-ce que|est-ce|calculate|compute|solve|evaluate|how much is|how much are|combien font|combien fait|combien est|combien|calcule|calculez|calculer|resous|quel est le resultat de|quel est|c'est quoi|ca fait|donne-moi|give me|the result of|le resultat de|resultat de)\b[\s:,]*/;
   for (let i = 0; i < 4 && lead.test(s); i++) s = s.replace(lead, '');
+  s = s.replace(/^(?:the|le|la|les|l')\s*/, '');
+  for (const [re, to] of PHRASES) s = s.replace(re, to);
+  if (/^\([^()]*\)$/.test(s.trim())) s = s.trim().slice(1, -1); // "half of 50" -> 50/2, no needless brackets
   s = s.replace(/[?!.=\s]+$/g, ''); // drop a trailing ? ! . =
   // percentages: "20% of 150", "20 percent of 150", "20 pour cent de 150"
   s = s.replace(new RegExp(`${NUM}\\s*(?:%|percent|per cent|pour cent|pourcent)\\s*(?:of|de|d')\\s*`, 'g'), '$1%*');
@@ -198,6 +267,8 @@ function show(tokens, lang) {
 
 function solve(text, lang = 'en') {
   lang = lang === 'fr' ? 'fr' : 'en';
+  const prop = propertyQuestion(wordsToNumbers(String(text).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[?!.\s]+$/g, '')), lang);
+  if (prop) return prop;
   const s = normalize(text);
   if (!s || s.length > 300) return null;
   const tokens = tokenize(s);

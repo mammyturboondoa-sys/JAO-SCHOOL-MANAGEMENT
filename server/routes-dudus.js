@@ -1,6 +1,8 @@
 'use strict';
 const S = require('./security');
 const HELP = require('./help');
+const MATHCHAT = require('./mathchat');
+const SCHCHAT = require('./dudus-scholarships');
 
 const ADMIN = ['school_admin'];
 const ANY = ['school_admin', 'teacher', 'parent', 'student'];
@@ -39,9 +41,13 @@ module.exports = function (app) {
     return { help, kb };
   }
 
-  async function answer({ schoolId, role, lang, text }) {
+  async function answer({ schoolId, role, lang, text, user }) {
     const m = MSG[lang];
+    const calc = MATHCHAT.solve(text, lang); // basic arithmetic and logic are answered exactly, locally
+    if (calc) return { text: calc, source: null };
     if (PRIVATE.test(text)) return { text: m.private, source: null };
+    const sch = await SCHCHAT.answer(h, { user, lang, text }); // real scholarship records only
+    if (sch) return { text: sch, source: 'Scholarships' };
     const { help, kb } = await retrieve(schoolId, role, lang, text);
     if (!help.length && !kb.length) return { text: m.none, source: null };
     // Optional: let an AI model phrase the answer, but ONLY from the retrieved approved snippets.
@@ -79,7 +85,7 @@ module.exports = function (app) {
   route('POST', '/dudus/chat', ANY, async (c) => {
     const { text, lang } = clean(c.body);
     if (!S.rateLimit(`chat:${c.user.id}`, 30, 60 * 1000)) throw new S.HttpError(429, 'too_many_attempts');
-    const ans = await answer({ schoolId: c.schoolId, role: c.user.role, lang, text });
+    const ans = await answer({ schoolId: c.schoolId, role: c.user.role, lang, text, user: c.user });
     await h.tx(async () => {
       await h.run('INSERT INTO chat_history (school_id, user_id, role, content) VALUES (?,?,?,?)', c.schoolId, c.user.id, 'user', text);
       await h.run('INSERT INTO chat_history (school_id, user_id, role, content) VALUES (?,?,?,?)', c.schoolId, c.user.id, 'assistant', ans.text);
