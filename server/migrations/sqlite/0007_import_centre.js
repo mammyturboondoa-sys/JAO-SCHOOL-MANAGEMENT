@@ -3,7 +3,7 @@
 // Additive only: nothing existing is altered. Every link to school data is a COMPOSITE (school_id, id) key,
 // so the database itself refuses a row that points at another school's records.
 module.exports = {
-  version: 7, name: 'import_centre',
+  version: 11, name: 'import_centre',
   up(db) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS import_batches (
